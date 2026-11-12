@@ -59,13 +59,18 @@ UART_HandleTypeDef huart3;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
-#define FIR_NUM_TAPS  5U
+#define FIR_NUM_TAPS 201U
 #define FIR_TEST_SIZE 12U
+#define FIR_SAMPLE_RATE_HZ 50.0f
+#define FIR_SAMPLE_PERIOD_MS 20U
+#define FIR_CUTOFF_HZ 1.0f
+/* For this 201-tap Hamming-window design, this places the -3 dB point near 1 Hz. */
+#define FIR_SINC_DESIGN_HZ (FIR_CUTOFF_HZ * 1.10f)
+#define FIR_PI 3.14159265358979323846f
 
-static float32_t firCoeffs[FIR_NUM_TAPS] =
-{
-  0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f
-};
+static float32_t firCoeffs[FIR_NUM_TAPS];
+static uint32_t sampleDeadlineMs;
+static uint32_t sampleTimestampMs;
 
 static float32_t firTestState[FIR_NUM_TAPS + FIR_TEST_SIZE - 1U];
 
@@ -74,6 +79,10 @@ static float32_t firTestInput[FIR_TEST_SIZE] =
   1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
   0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
 };
+
+
+
+
 
 static float32_t firTestOutput[FIR_TEST_SIZE];
 static arm_fir_instance_f32 firTestInstance;
@@ -105,14 +114,44 @@ static void MX_USB_OTG_FS_PCD_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void FIR_DesignLowpass(void)
+{
+  uint32_t n;
+  int32_t center = (int32_t)(FIR_NUM_TAPS - 1U) / 2;
+  float32_t sum = 0.0f;
+  float32_t normalizedCutoff = FIR_SINC_DESIGN_HZ / FIR_SAMPLE_RATE_HZ;
+
+  /* Ideal low-pass sinc multiplied by a Hamming window. */
+  for (n = 0U; n < FIR_NUM_TAPS; n++)
+  {
+    int32_t offset = (int32_t)n - center;
+    float32_t ideal;
+    float32_t window = 0.54f - 0.46f * cosf(2.0f * FIR_PI * (float32_t)n
+                                           / (float32_t)(FIR_NUM_TAPS - 1U));
+
+    if (offset == 0)
+    {
+      ideal = 2.0f * normalizedCutoff;
+    }
+    else
+    {
+      ideal = sinf(2.0f * FIR_PI * normalizedCutoff * (float32_t)offset)
+              / (FIR_PI * (float32_t)offset);
+    }
+
+    firCoeffs[n] = ideal * window;
+    sum += firCoeffs[n];
+  }
+
+  /* Normalize DC gain to one, so a constant acceleration stays unchanged. */
+  for (n = 0U; n < FIR_NUM_TAPS; n++)
+  {
+    firCoeffs[n] /= sum;
+  }
+}
+
 static void FIR_RunKnownSignalTest(void)
 {
-  const float32_t expected[FIR_TEST_SIZE] =
-  {
-    0.0625f, 0.25f, 0.375f, 0.25f, 0.0625f,
-    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
-  };
-
   uint32_t i;
   firTestPassed = 1U;
 
@@ -129,7 +168,8 @@ static void FIR_RunKnownSignalTest(void)
 
   for (i = 0U; i < FIR_TEST_SIZE; i++)
   {
-    if (fabsf(firTestOutput[i] - expected[i]) > 0.00001f)
+    /* An impulse input should produce the FIR coefficient sequence. */
+    if (fabsf(firTestOutput[i] - firCoeffs[i]) > 0.00001f)
     {
       firTestPassed = 0U;
     }
@@ -174,7 +214,31 @@ int main(void)
   MX_USART3_UART_Init();
   MX_USB_OTG_FS_PCD_Init();
   /* USER CODE BEGIN 2 */
+  FIR_DesignLowpass();
   FIR_RunKnownSignalTest();
+
+  uartLength = snprintf(uartMessage,
+                        sizeof(uartMessage),
+                        "# FIR impulse test: %s\r\n",
+                        (firTestPassed != 0U) ? "PASS" : "FAIL");
+  if (uartLength > 0 && uartLength < (int)sizeof(uartMessage))
+  {
+    HAL_UART_Transmit(&huart1,
+                      (uint8_t *)uartMessage,
+                      (uint16_t)uartLength,
+                      HAL_MAX_DELAY);
+  }
+
+  uartLength = snprintf(uartMessage,
+                        sizeof(uartMessage),
+                        "time_ms,raw_x_mg,filtered_x_mg_x10\r\n");
+  if (uartLength > 0 && uartLength < (int)sizeof(uartMessage))
+  {
+    HAL_UART_Transmit(&huart1,
+                      (uint8_t *)uartMessage,
+                      (uint16_t)uartLength,
+                      HAL_MAX_DELAY);
+  }
 
   if (BSP_ACCELERO_Init() != ACCELERO_OK)
   {
@@ -186,6 +250,7 @@ int main(void)
                    firCoeffs,
                    firLiveState,
                    1U);
+  sampleDeadlineMs = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -194,6 +259,7 @@ int main(void)
   {
     /* USER CODE END WHILE */
 	  BSP_ACCELERO_AccGetXYZ(accelXYZ);
+	  sampleTimestampMs = HAL_GetTick();
 
 	  /* xyz[0] 是 X 軸加速度，單位 mg */
 	  firLiveInput = (float32_t)accelXYZ[0];
@@ -203,18 +269,33 @@ int main(void)
 	              &firLiveOutput,
 	              1U);
 
+	  /* Send timestamp (ms), raw X (mg), and filtered X in 0.1 mg units. */
 	  uartLength = snprintf(uartMessage,
 	                        sizeof(uartMessage),
-	                        "X raw: %d mg, X filtered: %.2f mg\r\n",
-	                        accelXYZ[0],
-	                        (double)firLiveOutput);
+	                        "%lu,%d,%ld\r\n",
+	                        (unsigned long)sampleTimestampMs,
+	                        (int)accelXYZ[0],
+	                        (long)((int32_t)(firLiveOutput * 10.0f)));
 
-	  HAL_UART_Transmit(&huart1,
-	                    (uint8_t *)uartMessage,
-	                    (uint16_t)uartLength,
-	                    HAL_MAX_DELAY);
+	  if (uartLength > 0 && uartLength < (int)sizeof(uartMessage))
+	  {
+	    HAL_UART_Transmit(&huart1,
+	                      (uint8_t *)uartMessage,
+	                      (uint16_t)uartLength,
+	                      HAL_MAX_DELAY);
+	  }
 
-	  HAL_Delay(19);
+	  /* Keep a nominal 50 Hz sample cadence (20 ms per sample). */
+	  sampleDeadlineMs += FIR_SAMPLE_PERIOD_MS;
+	  if ((int32_t)(sampleDeadlineMs - HAL_GetTick()) > 0)
+	  {
+	    HAL_Delay(sampleDeadlineMs - HAL_GetTick());
+	  }
+	  else
+	  {
+	    /* If output/processing took too long, restart the schedule from now. */
+	    sampleDeadlineMs = HAL_GetTick();
+	  }
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
